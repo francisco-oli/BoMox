@@ -2,27 +2,24 @@
 
 ## Summary
 
-An ongoing MSc thesis project ([Instituto Superior Técnico]) building a
+Ongoing MSc thesis project at [Instituto Superior Técnico] building a
 foundation model for 3D human motion: a model that learns a single,
 general-purpose motion embedding by aligning motion, video, and text into a
 shared representation space, while also learning to complete masked
 (missing) motion sequences.
 
 This repository contains a **curated set of components** from the full
-project, selected to showcase system design and — mainly — the debugging
+project, selected to showcase system design and the debugging
 and experiment-design work that went into making it actually function
 correctly. It is not a runnable end-to-end pipeline; the full system
-depends on a large, license-restricted dataset and a university compute
-cluster. What's here is the technical substance, not the plumbing.
+depends on a large, license-restricted dataset
 
 ---
 
 ## What the project is
 
 **Goal.** Learn a motion representation useful for multiple downstream
-tasks (retrieval, classification, motion completion/forecasting) — not
-just one, which is what distinguishes a *foundation* model from a
-single-task one.
+tasks (retrieval, classification, motion reconstruction)
 
 **Architecture, at a high level:**
 - A **motion branch**: 3D motion sequences are encoded with a frozen
@@ -43,18 +40,22 @@ single-task one.
   representation via cross-attention. This exists to (a) empirically
   measure how much real motion information the representation retains,
   beyond what's minimally needed for contrastive discrimination, and
-  (b) give the model a direct motion-completion/inpainting capability.
+  (b) give the model a direct motion-reconstruction capability.
 
-**Evaluation methodology:**
-- Cross-modal retrieval (Recall@1/5/10), following standard practice from
-  the CLIP / vision-language retrieval literature.
-- A dedicated held-out data split (two full data subsets, never seen
-  during training or validation) specifically for testing generalization
-  to novel motion domains.
-- A causal-attribution test (embedding-swap ablation) isolating how much
-  of the model's reconstruction quality is actually attributable to the
-  learned representation, as opposed to other available signal.
 
+  ---
+
+## Dataset and Data Curation
+
+Training data is drawn from Motion-X++, a large-scale, multimodal (motion + video + text) human motion dataset comprising several distinct subdatasets.
+
+**Data Curation**
+- The dataset used consists of approximately 26K samples, each comprising one video, one variable-length motion sequence, and a sequence-level text label, drawn from 7 different Motion-X++ subsets spanning a wide range of motion semantics.
+- An LLM-based semantic characterization of the dataset was performed to profile its content and evaluate semantic diversity, identifying broad motion categories including Sports and Fitness, Music and Instrument Playing, Domestic Chores, and Communication/Expressive Action.
+- This same characterization pipeline surfaced anomalies in the text labels (e.g., "Sorry, I can’t provide information about
+the person in the video."), informing further data curation, alongside separate detection and removal of malformed motion/video samples.
+- Subsets were split in a stratified manner (independently per subset, then recombined) to ensure proportional representation across train/validation/test despite substantial size imbalance between sources.
+- Two subsets (Animation, Kungfu) — chosen for being the most stylistically distinct from the rest and comprising a small percentage of the data — were held out entirely, reserved as a dedicated out-of-distribution generalization test set.
 ---
 
 ## Problems I encountered (and how I solved them)
@@ -69,13 +70,11 @@ informative part.
 **Symptom:** LoRA adapters injected into a CLIP video encoder had
 `requires_grad=True`, were correctly registered in the optimizer, and yet
 their weights (`lora_B`) remained *exactly* at their zero-initialization
-value after hundreds of training epochs — not slowly moving, not noisy,
-completely static.
+value after several training epochs.
 
 **Investigation:** Checked `requires_grad` (True). Checked optimizer
 parameter groups (present, correctly registered). Checked the actual
-gradient tensor after a real backward pass — `None`. Not small, not
-starved by other loss terms: structurally absent from the computation
+gradient tensor after a real backward pass — `None`. Structurally absent from the computation
 graph entirely.
 
 **Root cause:** `torch.nn.MultiheadAttention.forward()` doesn't call its
@@ -89,10 +88,7 @@ exists in the model, but the computation graph never routes through it.
 **Fix:** Implemented `PatchedMultiheadAttention` — a drop-in replacement
 exposing `q_proj`/`k_proj`/`v_proj`/`out_proj` as real, individually-called
 `nn.Linear` submodules, so PEFT's module-replacement approach actually
-works. Verified numerically identical to the original layer (max
-difference `0.0` across matched inputs, both with and without a causal
-attention mask) before any adapter training — confirming the fix changed
-*trainability*, not *behavior*. → [`Patched_Attention.py`](./Patched_Attention.py)
+works. 
 
 </details>
 
@@ -162,33 +158,19 @@ of the work.
    fixed) — the gap between the two directly measures how much the
    representation, specifically, contributes. This confirmed the
    representation went from barely influencing reconstruction quality to
-   being a substantial, measurable contributor. →
-   [`noise_swap_check.py`](./noise_swap_check.py)
+   being a substantial, measurable contributor.
 
 </details>
 
-<details>
-<summary><b>4. A silent train/test split mismatch between two scripts</b></summary>
+<details> <summary><b>5. Rising validation contrastive loss looked like overfitting</b></summary>
 
-**Symptom:** A held-out validation/test split was correctly designed
-(stratified across multiple data sources, with dedicated
-never-trained-on subsets for generalization testing) — but a *second*
-script, used for qualitative inspection of model outputs, independently
-re-implemented the same splitting logic instead of reusing it.
+Symptom: Validation contrastive loss rose ~18% over the course of training (while training loss fell over the same span) 
+Investigation: First ruled out a BatchNorm train/eval mode mismatch as an alternative explanation, by directly comparing identical weights on identical data in both modes (losses were nearly equal — ruled out, see #2). This left genuine overfitting as the apparent remaining explanation. However, InfoNCE cross-entropy is scaled by the model's learned temperature parameter (logit_scale), which increases over training as a normal part of contrastive learning.
 
-**Root cause:** The second implementation differed in three ways that
-weren't obvious individually — it included data sources meant to be fully
-held out, it aligned samples via non-deterministic set ordering rather
-than a fixed sort, and its Python dictionary/set iteration order wasn't
-guaranteed stable across runs. The two scripts' "test sets" had silently
-diverged.
+Resolution: Computed retrieval accuracy (Top-1/Top-5) on the same validation checkpoints — a ranking-based metric that is mathematically invariant to any monotonic rescaling of similarity scores, including temperature. Retrieval accuracy was flat-to-improving across the exact epochs where loss appeared to worsen, directly showing the rising loss was a scale artifact, not model degradation. Retrieval-based metrics were adopted as the primary validation signal going forward, with loss retained only as a secondary diagnostic.
 
-**Fix:** Factored the entire splitting procedure into a single shared
-module (`data_split.py`), imported identically by every script that needs
-it, with a fixed seed and deterministic sorting before any random
-shuffling. This eliminates the possibility of two scripts disagreeing
-about what "test data" means, by construction rather than by convention.
-→ [`data_split.py`](./data_split.py)
+</details>
+
 
 </details>
 
@@ -206,10 +188,9 @@ about what "test data" means, by construction rather than by convention.
 
 ## Status
 
-Active thesis project, expected completion **[Month/Year]**, supervised by
-**[Advisor Name]**. Full results and final architecture will be added on
+Active thesis project, expected completion **November/2026**. Full results and final architecture will be added on
 completion; this repository will be updated accordingly.
 
 ## Contact
 
-[Your name] · [email] · [LinkedIn] · [other links]
+Francisco Oliveira · francisco.casaleiro.oliveira@tecnico.ulisboa.pt

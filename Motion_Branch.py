@@ -23,10 +23,7 @@ class Motion_Branch(nn.Module):
     self.reconstructor = reconstructor
 
   def forward(self, x):
-
     final_emb, unpooled_seq = self.motion_encoder(x)
     output = self.reconstructor(x, final_emb, unpooled_seq)
-
     return output, final_emb
-  
 

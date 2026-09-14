@@ -77,100 +77,71 @@ class Multimodal_Dataset(Dataset):
     def __getitem__(self, idx):
 
         try:
-
             motion_file_name = self.motion_files[idx]
             text_file_name = self.text_files[idx]
             video_file_name = self.video_files[idx]
 
-            #TEXT
             with open(text_file_name, 'r') as f:
                 text_file = f.read()
 
-
-            #MOTION
             with open(motion_file_name, 'r') as f:
                 raw_data = json.load(f)
 
-            # Process motion sample
             full_sequence = process_motion_x(raw_data)
-
             if len(full_sequence) < 8:
                 raise ValueError(f"Sequence too short: {len(full_sequence)} frames")
 
-            # Get window/ pad to 512
             window = get_random_window(full_sequence, self.window_size)
 
-            #  Create padding mask
+            # padding mask: 1 for real frames, 0 for padded ones
             mask = np.zeros(self.window_size, dtype=np.float32)
             valid_length = min(len(full_sequence), self.window_size)
             mask[:valid_length] = 1.0
 
-            # How many frames to mask
-            masking_ratio = np.random.uniform(self.mean_masking - 0.05 , self.mean_masking + 0.05)
+            # additionally mask out a random contiguous block for the reconstruction target
+            masking_ratio = np.random.uniform(self.mean_masking - 0.05, self.mean_masking + 0.05)
             block_size = max(1, int(valid_length * masking_ratio))
             block_size = min(block_size, valid_length)
 
-            # What frames to mask
             max_start_idx = valid_length - block_size
             start_idx = np.random.randint(0, max_start_idx + 1)
             end_idx = start_idx + block_size
-
             mask[start_idx:end_idx] = 0.0
-
-            #VIDEO
 
             video_file = torch.load(video_file_name)
 
             return torch.from_numpy(window).float(), torch.from_numpy(mask).float(), valid_length, text_file, video_file, motion_file_name
-        
+
         except (json.JSONDecodeError, Exception) as e:
-            # Print a clear warning showing exactly which file failed
             print(f"\n[WARNING] Skipping corrupt sample at index {idx}: {self.motion_files[idx]}. Error: {e}")
-            
-            # Pick another random index to return instead so the batch doesn't break
             new_idx = random.randint(0, len(self) - 1)
             return self.__getitem__(new_idx)
         
     
     
 def moment_collate_fn(batch):
-    """
-    Reshapes the batch specifically for MOMENT's [B*C, 1, L] requirement
-    """
+    """Reshapes the batch to MOMENT's expected [B*C, 1, L] layout."""
     windows, masks, valid_length, text, video, motion_file_name = zip(*batch)
-    windows = torch.stack(windows) # [B, L, C]
-    masks = torch.stack(masks)     # [B, L]
+    windows = torch.stack(windows)  # [B, L, C]
+    masks = torch.stack(masks)      # [B, L]
 
     B, L, C = windows.shape
 
-    # Prep for MOMENT: [B, L, C] -> [B, C, L] -> [B*C, 1, L]
+    # [B, L, C] -> [B, C, L] -> [B*C, 1, L]
     mx_batch = windows.permute(0, 2, 1).reshape(B * C, 1, L)
-
-    # Expand masks to match channels: [B, L] -> [B*C, L]
-    mx_masks = masks.repeat_interleave(C, dim=0)
+    mx_masks = masks.repeat_interleave(C, dim=0)  # [B, L] -> [B*C, L]
 
     subsampled_videos = []
-    
     for video_tensor in video:
-        # video_tensor shape: [T_original, 3, 224, 224]
         T_orig = video_tensor.shape[0]
-        
+
         if T_orig == 0:
-            # Fallback if the video was completely corrupt/empty
             sampled = torch.zeros(NUM_FRAMES, 3, 224, 224)
-            
-        elif T_orig <= NUM_FRAMES:
-            # If the video is shorter than our target, we can repeat frames 
-            # or just pad this specific short one up to the target length
-            indices = torch.linspace(0, T_orig - 1, steps=NUM_FRAMES).long()
-            sampled = video_tensor[indices]
-            
         else:
-            # Uniformly select 'target_frames' across the whole timeline
-            # Example: Using torch.linspace guarantees we get the first and last frames
+            # linspace covers short and long videos alike, always including first/last frame
             indices = torch.linspace(0, T_orig - 1, steps=NUM_FRAMES).long()
             sampled = video_tensor[indices]
-            
+
         subsampled_videos.append(sampled)
 
     return mx_batch, mx_masks, list(valid_length), list(text), torch.stack(subsampled_videos), list(motion_file_name)

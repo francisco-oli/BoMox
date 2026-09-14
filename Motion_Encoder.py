@@ -27,12 +27,10 @@ class ModalityAwareSTAMP(STAMP):
       def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Modality Encodings
-        # 0: Trans (3), 1: Poses (165), 2: Betas (10)
+        # one embedding per SMPL-X field type: 0=trans (3 dims), 1=pose (165 dims), 2=betas (10 dims)
         self.modality_embedding = nn.Embedding(3, self.D)
         nn.init.normal_(self.modality_embedding.weight, std=0.02)
 
-        #Match Index to correct embedding
         modality_indices = torch.zeros(self.n_spatial_channels, dtype=torch.long)
 
         modality_indices[0:3] = 0
@@ -43,27 +41,20 @@ class ModalityAwareSTAMP(STAMP):
 
       def forward(self, x, return_attention=False):
 
-        x = x.unsqueeze(2).float() # (Batch, 178 joints, 1, 1024)
-
+        x = x.unsqueeze(2).float()  # (Batch, 178 joints, 1, 1024)
 
         if hasattr(self, 'linear'):
-            x = self.linear(x) #512 dim
+            x = self.linear(x)  # project down to 512 dim
 
-        # Modality embeddings
         m = self.modality_embedding(self.modality_indices)
-
-        # Reshape to broadcast
         x = x + m.view(1, self.n_spatial_channels, 1, self.D)
 
-        # Positional embeddings
         if self.use_positional_embeddings:
             x = self.add_positional_embeddings(x)
 
-        # Flatten for transformer
         B, S, T, D = x.shape
         x = x.view(B, S * T, D)
 
-        # transformer
         if self.transformer_params['type'] == 'basic':
             x = self.transformer(x)
         elif self.transformer_params['type'] == 'criss_cross':
@@ -79,14 +70,14 @@ class ModalityAwareSTAMP(STAMP):
 
 
 def create_stamp_model(feature_shape, config):
-    """Initialize CUSTOM ModalityAwareSTAMP model."""
+    """Builds the ModalityAwareSTAMP model from a feature shape and config dict."""
 
     batch_size, n_spatial, n_temporal, n_dim = feature_shape
 
     model = ModalityAwareSTAMP(
         input_dim=n_dim,
         D=config['model_dim'],
-        n_classes=1, #Dummy value
+        n_classes=1,  # unused, STAMP requires a value
         n_temporal_channels=n_temporal,
         n_spatial_channels=n_spatial,
         encoder_aggregation='attention_pooling',
@@ -135,25 +126,13 @@ class Motion_Encoder (nn.Module):
 
         self.feature_extractor = moment_model
 
-        # ===== RevIN eps fix (PERMANENT -- do not remove) =====
-        # RevIN normalizes as (x - mean) / (stdev + eps). MOMENT's library
-        # default eps=1e-5 is too small: a channel with near-zero real
-        # variance in its visible frames (a joint that barely moved) makes
-        # this division blow up to values in the thousands, which overflows
-        # under autocast's fp16 math a few layers into the frozen encoder.
-        # This caused a full NaN training run once already -- it must stay
-        # here, in the class itself, not as an external monkeypatch in
-        # train.py, so it can't be silently dropped in a future refactor.
         self.feature_extractor.normalizer.eps = 0.1
 
         _orig_normalize = self.feature_extractor.normalizer._normalize
         def _safe_normalize(x):
             out = _orig_normalize(x)
-            # Hard backstop in case some other pathway still produces an
-            # extreme value even with the raised eps.
             return torch.clamp(out, -20.0, 20.0)
         self.feature_extractor.normalizer._normalize = _safe_normalize
-        # ===== END RevIN eps fix =====
 
         self.stamp_model = create_stamp_model((batch_size, 178, 1, 1024), stamp_config)
 
@@ -165,39 +144,26 @@ class Motion_Encoder (nn.Module):
     smpl_batch = smpl_batch.to(self.device)
     masks = masks.to(self.device)
 
-    # Guard Rail --------------------------------
-
     patch_len = getattr(self.feature_extractor, 'patch_len', 8)
-    
-    # Get the actual shape of the masks tensor (which is B*C, seq_len)
     num_rows, seq_len = masks.shape
-    
-    # Reshape the mask to group frames into patches
     mask_patched = masks.view(num_rows, -1, patch_len)
-    
-    # A patch is only valid if ALL frames in it are visible (sum equals patch_len)
     valid_patches = (mask_patched.sum(dim=-1) == patch_len).long()
-    
-    # Find any rows in the batch that have exactly zero valid patches
     bad_rows = (valid_patches.sum(dim=-1) == 0)
-    
-    if bad_rows.any():
-        # Force the first patch (frames 0 to patch_len - 1) to be fully visible 
-        # ONLY for the rows that mathematically failed.
-        masks[bad_rows, :patch_len] = 1.0
 
-    # --------------------------------------------
+    if bad_rows.any():
+        masks[bad_rows, :patch_len] = 1.0
 
     with autocast('cuda'):
 
-      #Contrastive Path
+      # contrastive path: pooled embedding per sample
       output_pooled = self.feature_extractor(x_enc=smpl_batch, input_mask=masks)
       emb = output_pooled.embeddings.view(-1, 178, 1024)
       emb = emb.to(self.device)
       final_emb = self.stamp_model(emb)
 
+      # reconstruction path: per-patch embeddings, kept unpooled for the decoder
       output_unpooled = self.feature_extractor(x_enc=smpl_batch, input_mask=masks, reduction='none')
-      unpooled_features = output_unpooled.embeddings.squeeze(1) # Shape: (B*178, 64, 1024)
+      unpooled_features = output_unpooled.embeddings.squeeze(1)  # (B*178, 64, 1024)
       unpooled_seq = unpooled_features.view(-1, 178, 64, 1024)
 
     return final_emb, unpooled_seq

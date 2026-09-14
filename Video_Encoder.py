@@ -1,4 +1,3 @@
-#Package imports
 import sys
 import os
 import json
@@ -18,7 +17,6 @@ from transformers import CLIPVisionModel
 
 from patched_attention import patch_attention_in_transformer
 
-#STAMP Imports
 stamp_internal_root = os.path.abspath("./STAMP")
 
 if stamp_internal_root not in sys.path:
@@ -34,10 +32,8 @@ class CLIP_Video(nn.Module):
 
     video_encoder = model
 
-    # Replace nn.MultiheadAttention with an explicit-projection equivalent
-    # BEFORE LoRA is attached, so q_proj/v_proj/out_proj are real submodules
-    # that actually get called during forward() -- see PatchedMultiheadAttention
-    # docstring above for why this is necessary.
+    # Swaps nn.MultiheadAttention for explicit q/k/v projections before LoRA
+    # is attached, since LoRA needs q_proj/v_proj/out_proj to be real submodules.
     patch_attention_in_transformer(video_encoder.visual.transformer)
 
     config = LoraConfig(
@@ -54,21 +50,14 @@ class CLIP_Video(nn.Module):
 
     self.device = device
 
-    #self.linear = nn.Linear(video_encoder.config.hidden_size, 512)
-
   def forward(self, x):
-
     batch_size, num_frames, c, h, w = x.shape
-    x_flattened = x.reshape(-1, c, h, w) #Reshape for CLIP
-    x_flattened = x_flattened.to(self.device)
+    x_flattened = x.reshape(-1, c, h, w).to(self.device)  # flatten frames into the batch dim for CLIP
 
     emb = self.model.encode_image(x_flattened).view(batch_size, num_frames, -1)
 
-    #emb = out.pooler_output.view(batch_size, num_frames, -1)
-    #emb = self.linear(emb)
-
     return emb
-  
+
 
 class Video_MHAP(STAMP):
     def __init__(self, *args, **kwargs):
@@ -91,14 +80,14 @@ def create_mhap(feature_shape, config):
     model = Video_MHAP(
         input_dim=n_dim,
         D=config['model_dim'],
-        n_classes=1, #Dummy value
+        n_classes=1,  # unused, STAMP requires a value
         n_temporal_channels=n_temporal,
         n_spatial_channels=1,
         encoder_aggregation='attention_pooling',
         use_batch_norm=True,
         use_instance_norm=False,
 
-        mhap_params = {
+        mhap_params={
             'A': 4,
             'n_queries_per_head': 8,
             'dropout_rate': 0.3,
@@ -106,15 +95,12 @@ def create_mhap(feature_shape, config):
             'lambda_for_residual': 0.5
         },
 
-        #Dummy
+        # unused, only the pooling head is used here
         final_classifier_params={
             'hidden_sizes': [64],
             'dropout_rate': config['dropout']
         },
-
-        #Dummy
         initial_proj_params={'type': 'full', 'dropout_rate': config['dropout']},
-
     )
     return model
 

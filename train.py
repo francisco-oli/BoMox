@@ -30,8 +30,7 @@ if LClip_internal_root not in sys.path:
 
 from model import longclip
 
-#GLOBAL TRAINING VARIABLES
-
+# Training config
 EPOCHS = 60
 WEIGHT_DECAY = 1e-5
 LEARNING_RATE = 1e-4
@@ -40,7 +39,6 @@ VALIDATE_EVERY_N_EPOCHS = 1
 EARLY_STOPPING_PATIENCE = 15
 CHECKPOINT_EVERY_N_EPOCHS = 10
 
-# Global Variables
 BATCH_SIZE = 32
 NUM_FRAMES = 20
 WINDOW_SIZE = 512
@@ -64,40 +62,26 @@ MHAP_CONFIG = {
 }
 
 def contrastive_loss(features_a, features_b, logit_scale):
-    """
-    Computes standard symmetric InfoNCE contrastive loss across a batch.
-    """
-    # Normalize features to unit vectors
+    """Symmetric InfoNCE loss between two sets of paired embeddings."""
     features_a = F.normalize(features_a, dim=-1)
     features_b = F.normalize(features_b, dim=-1)
-    
-    # Calculate similarity matrices
+
     scale = logit_scale.exp()
     logits_per_a = scale * torch.matmul(features_a, features_b.t())
     logits_per_b = logits_per_a.t()
-    
-    # Ground truth targets
+
     labels = torch.arange(features_a.size(0), device=features_a.device)
-    
     loss_a = F.cross_entropy(logits_per_a, labels)
     loss_b = F.cross_entropy(logits_per_b, labels)
-    
+
     return (loss_a + loss_b) / 2
 
 
 def compute_batch_losses(batch, motion_branch, video_encoder, text_encoder, logit_scale, device):
     """
-    Shared forward + loss computation, used IDENTICALLY by the training loop
-    and the validation pass. Never duplicate this logic inline elsewhere --
-    that's exactly how train.py and forward_pass.py's data splits drifted
-    apart earlier in this project.
-
-    Caller is responsible for the torch.no_grad() context (validation) or
-    lack thereof (training), and for optimizer.zero_grad()/backward()/step()
-    around this in the training case. This function only computes losses.
-
-    Returns: total_loss, loss_recon, loss_contrastive, motion_output,
-             motion_representation, video_output, text_output
+    Shared forward + loss computation for both the training loop and validation pass.
+    Keep this the single source of truth -- train/val logic drifting apart here has
+    caused mismatched splits before. Caller owns the no_grad/backward/step context.
     """
     motion_sample, motion_mask, valid_length, text_sample, video_sample, motion_file_name = batch
 
@@ -108,7 +92,6 @@ def compute_batch_losses(batch, motion_branch, video_encoder, text_encoder, logi
     video_sample = video_sample.to(device)
 
     with autocast('cuda'):
-        # Forward pass
         motion_output, motion_representation = motion_branch([motion_sample, motion_mask])
         text_output = text_encoder(text_sample)
         video_output = video_encoder(video_sample)
@@ -129,30 +112,26 @@ def compute_batch_losses(batch, motion_branch, video_encoder, text_encoder, logi
         diff_sq = (motion_output - target_motion) ** 2
         masked_diff = diff_sq * recon_mask_3d
 
-        # Normalize division by total unmasked items to avoid scale distortion
+        # divide by unmasked element count so batches with different mask ratios stay comparable
         num_masked_elements = recon_mask_3d.sum()
         if num_masked_elements > 0:
             loss_recon = masked_diff.sum() / (num_masked_elements * target_motion.size(-1))
         else:
             loss_recon = torch.tensor(0.0, device=device)
 
-        # Cross-Modality Contrastive Loss
+        # contrastive loss across all three modality pairs
         loss_contrastive_video = contrastive_loss(motion_representation, video_output, logit_scale)
         loss_contrastive_text = contrastive_loss(motion_representation, text_output, logit_scale)
         loss_contrastive_mixed = contrastive_loss(video_output, text_output, logit_scale)
         loss_contrastive = (loss_contrastive_video + loss_contrastive_text + loss_contrastive_mixed) / 3.0
 
-        # Combined Loss
         total_loss = loss_contrastive + (LOSS_BALANCE * loss_recon)
 
     return total_loss, loss_recon, loss_contrastive, motion_output, motion_representation, video_output, text_output
 
 
 def run_validation(val_loader, motion_branch, video_encoder, text_encoder, logit_scale, device):
-    """
-    Runs a full pass over the validation set in eval mode.
-    Returns loss metrics AND retrieval metrics (Top-1, Top-5, Top-10).
-    """
+    """Runs a full validation pass in eval mode, returning loss and retrieval (Top-1/5/10) metrics."""
     motion_branch.eval()
     video_encoder.eval()
     text_encoder.eval()
@@ -160,7 +139,6 @@ def run_validation(val_loader, motion_branch, video_encoder, text_encoder, logit
     total_sum, recon_sum, contrastive_sum = 0.0, 0.0, 0.0
     valid_count, nan_count = 0, 0
 
-    # Collectors for retrieval metrics
     all_motion = []
     all_video = []
     all_text = []
@@ -176,20 +154,18 @@ def run_validation(val_loader, motion_branch, video_encoder, text_encoder, logit
                     recon_sum += loss_recon.item()
                     contrastive_sum += loss_contrastive.item()
                     valid_count += 1
-                    
-                    # Store normalized embeddings for retrieval metrics
+
                     all_motion.append(F.normalize(motion_rep, dim=-1))
                     all_video.append(F.normalize(video_out, dim=-1))
                     all_text.append(F.normalize(text_out, dim=-1))
                 else:
                     nan_count += 1
     finally:
-        # Always restore train mode, even if validation raised partway through.
+        # restore train mode even if validation raised partway through
         motion_branch.train()
         video_encoder.train()
         text_encoder.train()
 
-    # Compute averages for losses
     if valid_count > 0:
         avg_total = total_sum / valid_count
         avg_recon = recon_sum / valid_count
@@ -198,25 +174,20 @@ def run_validation(val_loader, motion_branch, video_encoder, text_encoder, logit
         return (float('nan'), float('nan'), float('nan'),
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, nan_count)
 
-    # ----- COMPUTE RETRIEVAL METRICS -----
-    # Concatenate all embeddings
     motion_emb = torch.cat(all_motion, dim=0).float()  # (N, 512)
     video_emb = torch.cat(all_video, dim=0).float()    # (N, 512)
     text_emb = torch.cat(all_text, dim=0).float()      # (N, 512)
 
-    # Similarity matrices (Motion -> Video, Motion -> Text)
+    # retrieval: for each motion embedding, is the matching video/text embedding
+    # among its top-k nearest neighbors? ground truth is the diagonal (paired samples).
     sim_m2v = motion_emb @ video_emb.T
     sim_m2t = motion_emb @ text_emb.T
-
-    # Ground truth indices (diagonal)
     labels = torch.arange(motion_emb.size(0), device=device)
 
-    # Compute Top-1, Top-5, and Top-10 accuracy for Motion->Video
     m2v_top1 = (sim_m2v.topk(1, dim=1).indices == labels.unsqueeze(1)).float().mean().item()
     m2v_top5 = (sim_m2v.topk(5, dim=1).indices == labels.unsqueeze(1)).any(dim=1).float().mean().item()
     m2v_top10 = (sim_m2v.topk(10, dim=1).indices == labels.unsqueeze(1)).any(dim=1).float().mean().item()
 
-    # Compute Top-1, Top-5, and Top-10 accuracy for Motion->Text
     m2t_top1 = (sim_m2t.topk(1, dim=1).indices == labels.unsqueeze(1)).float().mean().item()
     m2t_top5 = (sim_m2t.topk(5, dim=1).indices == labels.unsqueeze(1)).any(dim=1).float().mean().item()
     m2t_top10 = (sim_m2t.topk(10, dim=1).indices == labels.unsqueeze(1)).any(dim=1).float().mean().item()
@@ -250,8 +221,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    # Fetch Data -- via the shared split module, so this is guaranteed
-    # identical to whatever forward_pass.py / eval scripts use.
+    # split module is shared with eval scripts so the train/val/test split stays identical
     random.seed(42)
 
     split = build_split()
@@ -259,19 +229,13 @@ def main():
     val_mx, val_text, val_video = unzip_triples(split['val'])
     test_mx, test_text, test_video = unzip_triples(split['test'])
 
-
-    # Load Model Foundations
     long_clip_video, preprocess = longclip.load("./Long-CLIP/checkpoints/longclip-B.pt", device)
     long_clip_text, _ = longclip.load("./Long-CLIP/checkpoints/longclip-B.pt", device)
 
-    
-    # Freeze the backbone weights of Long-CLIP
     for param in long_clip_video.parameters():
         param.requires_grad = False
-
     for param in long_clip_text.parameters():
         param.requires_grad = False
-    
 
     dataset = Dataset.Multimodal_Dataset(train_mx, train_text, train_video, preprocess, NUM_FRAMES)
     loader = DataLoader(
@@ -288,13 +252,12 @@ def main():
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,  # no need to shuffle -- not used for gradient updates
+        shuffle=True,
         collate_fn=Dataset.moment_collate_fn,
         num_workers=4,
         pin_memory=True,
     )
 
-    # Initialize Modules
     motion_encoder = Mencoder.Motion_Encoder(device, BATCH_SIZE, STAMP_CONFIG)
     reconstructor = Mreconstruct.Reconstruction_Transformer()
     text_encoder = Tencoder.Text_Encoder(long_clip_text, device)
@@ -312,22 +275,15 @@ def main():
                 print(f"  {param_name}: {param.numel()} params")
         print(f"Total: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}\n")
 
-    # After instantiating text_encoder and video_encoder:
-    #print_peft_trainable(text_encoder.text_encoder.transformer, "Text Encoder")
-    #print_peft_trainable(video_encoder.clip_encoder.model, "Video Encoder")
-
     motion_branch = torch.compile(motion_branch)
     video_encoder = torch.compile(video_encoder)
 
-    # Set modules to Training Mode
     motion_branch.train()
     video_encoder.train()
     text_encoder.train()
 
-    # Learnable temperature
-    logit_scale = nn.Parameter(torch.ones([], device=device) * np.log(1 / 0.07))
+    logit_scale = nn.Parameter(torch.ones([], device=device) * np.log(1 / 0.07))  # learnable temperature
 
-    # Gather Trainable Parameters & Optimizer
     trainable_params = (
         list(motion_branch.parameters()) + 
         list(video_encoder.parameters()) + 
@@ -335,9 +291,8 @@ def main():
         [logit_scale]
     )
 
-    # Sanity check trainable parameters
     if args.params:
-        
+
         print("--- TRAINABLE PARAMETERS ---")
         total_params = 0
         for name, param in motion_branch.named_parameters():
@@ -367,36 +322,31 @@ def main():
     scaler = GradScaler('cuda')
     epochs = EPOCHS
 
-    # Scheduler now maximizes validation Motion→Video Top-1 accuracy
+    # maximizes validation Motion->Video Top-1 accuracy
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=3)
 
     start_epoch = 0
     checkpoint_file = os.path.join(CHECKPOINT_PATH, 'model8_epoch20.pt')
 
-    # Early stopping tracks best validation M2V Top-1 (higher is better)
-    best_val_metric = 0.0
+    best_val_metric = 0.0  # best validation M2V Top-1 seen so far, for early stopping
     bad_epochs = 0
 
     if args.resume:
         if os.path.exists(checkpoint_file):
             print(f"==> Explicitly resuming training from checkpoint: {checkpoint_file}")
             checkpoint = torch.load(checkpoint_file, map_location=device)
-            
-            # Load weights
+
             motion_branch.load_state_dict(checkpoint['motion_branch'])
             video_encoder.load_state_dict(checkpoint['video_encoder'])
             text_encoder.load_state_dict(checkpoint['text_encoder'])
-            
-            # Load scalar parameters 
+
             with torch.no_grad():
                 logit_scale.copy_(checkpoint['logit_scale'])
-                
-            # Load optimizer and scaler states
+
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-            # ----- RESTORE LEARNING RATE -----
             if 'current_lr' in checkpoint:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = checkpoint['current_lr']
@@ -404,29 +354,25 @@ def main():
             else:
                 print("==> Warning: No current_lr in checkpoint. Using default LR.")
 
-            # ----- RESTORE SCHEDULER -----
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 print("==> Loaded scheduler state.")
             else:
                 print("==> Warning: No scheduler state found. Starting fresh.")
 
-            # ----- RESTORE EARLY STOPPING STATE -----
-            # Try new key first, fallback to old key for compatibility
+            # older checkpoints tracked reconstruction loss (best_val_recon) instead of
+            # the retrieval metric -- fall back to a fresh early-stopping state for those
             if 'best_val_metric' in checkpoint:
                 best_val_metric = checkpoint['best_val_metric']
                 bad_epochs = checkpoint.get('bad_epochs', 0)
                 print(f"==> Loaded early stopping state: best_val_metric={best_val_metric:.4f}, bad_epochs={bad_epochs}")
             elif 'best_val_recon' in checkpoint:
-                # Legacy: best_val_recon stored reconstruction loss, but we now use metric
-                # Convert to 0.0 (safe fallback) and reset bad_epochs
                 best_val_metric = 0.0
                 bad_epochs = 0
                 print("==> Warning: Legacy checkpoint (best_val_recon) found. Resetting early stopping state.")
             else:
                 print("==> No early stopping state found. Starting fresh.")
-                
-            # Set start epoch
+
             start_epoch = checkpoint['epoch'] + 1
             print(f"==> Successfully loaded checkpoint. Resuming from Epoch {start_epoch + 1}")
         else:
@@ -435,9 +381,6 @@ def main():
     else:
         print("==> Flag '--resume' not specified. Starting a fresh training run from scratch.")
 
-
- 
-    # Initialize W&B
     wandb.init(
         entity="francisco-oli-instituto-superior-t-cnico",
         project="BOMOX",
@@ -453,12 +396,11 @@ def main():
             "window_size": WINDOW_SIZE
         }
     )
-    
-    # Optional: Track the global step for seamless charts when resuming
-    global_step = start_epoch * len(loader)
+
+    global_step = start_epoch * len(loader)  # keeps W&B charts continuous across resumes
 
     print("--- STARTING TRAINING LOOP ---")
-    epoch = start_epoch - 1   # guard for skip (if start_epoch==0, epoch=-1, but loop runs at least once)
+    epoch = start_epoch - 1  # in case the loop below never executes
     for epoch in range(start_epoch, epochs):
         epoch_loss = 0.0
         recon_loss_accum = 0.0
@@ -473,25 +415,15 @@ def main():
             total_loss, loss_recon, loss_contrastive, motion_output, motion_representation, video_output, text_output = \
                 compute_batch_losses(batch, motion_branch, video_encoder, text_encoder, logit_scale, device)
 
-
-            # Backward pass 
             scaler.scale(total_loss).backward()
-
-
             scaler.unscale_(optimizer)
-
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            # ===== END GRADIENT CLIPPING =====
-
             scaler.step(optimizer)
             scaler.update()
 
-
             with torch.no_grad():
-                logit_scale.clamp_(0, np.log(100))
-            # ===== END LOGIT SCALE CLAMP =====
+                logit_scale.clamp_(0, np.log(100))  # cap temperature to keep logits from exploding
 
-            # Track statistics
             if not torch.isnan(total_loss):
                 epoch_loss += total_loss.item()
                 recon_loss_accum += loss_recon.item()
@@ -511,10 +443,11 @@ def main():
                     "train/logit_scale": logit_scale.item(),
                     "epoch": epoch + 1 
                 }, step=global_step)
-            
+
             global_step += 1
 
-            # ===== LIVE DIVERSITY CHECK (first batch of each epoch) =====
+            # sanity check on the first batch of each epoch: are embeddings collapsing
+            # toward a single point (high cos-sim) instead of staying spread out?
             if progress_bar.n == 0:
                 with torch.no_grad():
                     rep = motion_representation.float()
@@ -537,10 +470,6 @@ def main():
                         "diversity/rep_div": rep_div.item(),
                         "diversity/out_div": out_div.item(),
                     }, step=global_step)
-            # ===== END LIVE DIVERSITY CHECK =====
-
-    
-
 
         if valid_batch_count > 0:
             avg_loss = epoch_loss / valid_batch_count
@@ -572,7 +501,6 @@ def main():
             "epoch/valid_batch_count": valid_batch_count,
         }, step=global_step)
 
-        # ===== VALIDATION =====
         if (epoch + 1) % VALIDATE_EVERY_N_EPOCHS == 0:
             (val_total, val_recon, val_contrastive,
              val_m2v_top1, val_m2v_top5, val_m2v_top10,
@@ -587,16 +515,13 @@ def main():
             print(f"  M2T -> Top-1: {val_m2t_top1*100:.2f}% | Top-5: {val_m2t_top5*100:.2f}% | Top-10: {val_m2t_top10*100:.2f}%")
             print(f"  (nan_batches={val_nan_count})\n")
 
-            # Step the scheduler based on Motion->Video Top-1 (MAXIMIZE)
-            scheduler.step(val_m2v_top1)
+            scheduler.step(val_m2v_top1)  # maximize M2V Top-1
 
-            # Early stopping and best checkpoint based on M2V Top-1
             if not np.isnan(val_m2v_top1):
                 if val_m2v_top1 > best_val_metric:
                     best_val_metric = val_m2v_top1
                     bad_epochs = 0
 
-                    # Save best checkpoint
                     os.makedirs(CHECKPOINT_PATH, exist_ok=True)
                     best_path = os.path.join(CHECKPOINT_PATH, 'model8_best_val.pt')
                     torch.save({
@@ -617,7 +542,6 @@ def main():
                 else:
                     bad_epochs += 1
 
-            # Log everything to W&B
             current_lr = optimizer.param_groups[0]['lr']
             wandb.log({
                 "val/avg_total_loss": val_total,
@@ -633,9 +557,7 @@ def main():
                 "train/learning_rate": current_lr,
                 "early_stopping/bad_epochs": bad_epochs,
             }, step=global_step)
-        # ===== END VALIDATION =====
 
-        # ===== Periodic checkpoint =====
         if (epoch + 1) % CHECKPOINT_EVERY_N_EPOCHS == 0:
             os.makedirs(CHECKPOINT_PATH, exist_ok=True)
             periodic_path = os.path.join(CHECKPOINT_PATH, f'model8_epoch{epoch+1}.pt')
